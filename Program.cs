@@ -74,8 +74,8 @@ var host = Host.CreateDefaultBuilder(args)
         LiveWriteIntervalSeconds =
             int.TryParse(cfg["ODISI_LIVE_WRITE_INTERVAL_SECONDS"], out var liveSec) ? liveSec : 1,
 
-        HistoryWriteIntervalMinutes =
-            int.TryParse(cfg["ODISI_HISTORY_WRITE_INTERVAL_MINUTES"], out var historyMin) ? historyMin : 1,
+        HistoryWriteIntervalSeconds =
+            int.TryParse(cfg["ODISI_HISTORY_WRITE_INTERVAL_SECONDS"], out var historySec) ? historySec : 60,
 
         ChannelCount =
             int.TryParse(cfg["ODISI_CHANNEL_COUNT"], out var channelCount) ? channelCount : 4,

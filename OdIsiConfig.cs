@@ -10,7 +10,7 @@ public sealed class OdIsiConfig
 
   public int LiveWriteIntervalSeconds { get; set; } = 1;
 
-  public int HistoryWriteIntervalMinutes { get; set; } = 1;
+  public int HistoryWriteIntervalSeconds { get; set; } = 60;
 
   public int ChannelCount { get; set; } = 4;
 

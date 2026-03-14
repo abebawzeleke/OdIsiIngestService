@@ -310,20 +310,15 @@ IF @@ROWCOUNT = 0
     {
       tsUtc = DateTime.SpecifyKind(tsUtc, DateTimeKind.Utc);
 
-      int intervalMinutes = _cfg.HistoryWriteIntervalMinutes <= 0
-          ? 1
-          : _cfg.HistoryWriteIntervalMinutes;
+      int intervalSeconds = _cfg.HistoryWriteIntervalSeconds <= 0
+          ? 60
+          : _cfg.HistoryWriteIntervalSeconds;
 
-      int bucketMinute = (tsUtc.Minute / intervalMinutes) * intervalMinutes;
+      // Total seconds since start of day, floored to interval
+      int totalSeconds = tsUtc.Hour * 3600 + tsUtc.Minute * 60 + tsUtc.Second;
+      int bucketSeconds = (totalSeconds / intervalSeconds) * intervalSeconds;
 
-      return new DateTime(
-          tsUtc.Year,
-          tsUtc.Month,
-          tsUtc.Day,
-          tsUtc.Hour,
-          bucketMinute,
-          0,
-          DateTimeKind.Utc);
+      return tsUtc.Date.AddSeconds(bucketSeconds);
     }
 
     private async Task InsertChannelHistoryIfNeededAsync(
