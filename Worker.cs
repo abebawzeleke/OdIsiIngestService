@@ -293,7 +293,7 @@ IF @@ROWCOUNT = 0
       tsUtc = DateTime.SpecifyKind(tsUtc, DateTimeKind.Utc);
 
       int intervalMinutes = _cfg.HistoryWriteIntervalMinutes <= 0
-          ? 5
+          ? 1
           : _cfg.HistoryWriteIntervalMinutes;
 
       int bucketMinute = (tsUtc.Minute / intervalMinutes) * intervalMinutes;
