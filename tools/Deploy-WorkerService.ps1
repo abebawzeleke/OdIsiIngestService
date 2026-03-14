@@ -144,8 +144,10 @@ try {
     # --------------------------------------------------------
     Write-ColorOutput "`nStep 0: Pull latest code..." "Cyan"
     Push-Location $ProjectDir
-    git pull origin main 2>&1 | ForEach-Object { Write-ColorOutput $_ "Gray" }
-    if ($LASTEXITCODE -ne 0) { throw "git pull failed." }
+    $gitOutput = & git pull origin main 2>&1 | Out-String
+    $gitExitCode = $LASTEXITCODE
+    Write-ColorOutput $gitOutput.Trim() "Gray"
+    if ($gitExitCode -ne 0) { Pop-Location; throw "git pull failed (exit code $gitExitCode)." }
     Pop-Location
     Write-ColorOutput "Code updated." "Green"
 
@@ -173,8 +175,10 @@ try {
     # --------------------------------------------------------
     Write-ColorOutput "`nStep 2: Build and publish..." "Cyan"
     Push-Location $ProjectDir
-    dotnet publish -c Release -o $ServicePath 2>&1 | ForEach-Object { Write-ColorOutput $_ "Gray" }
-    if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed." }
+    $pubOutput = & dotnet publish -c Release -o $ServicePath 2>&1 | Out-String
+    $pubExitCode = $LASTEXITCODE
+    Write-ColorOutput $pubOutput.Trim() "Gray"
+    if ($pubExitCode -ne 0) { Pop-Location; throw "dotnet publish failed (exit code $pubExitCode)." }
     Pop-Location
     Write-ColorOutput "Publish complete." "Green"
 
