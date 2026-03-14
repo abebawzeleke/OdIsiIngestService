@@ -236,6 +236,11 @@ namespace OdIsiIngestService
       }
     }
 
+    /// <summary>
+    /// Upserts one row per channel into OdIsiLiveVector.
+    /// LiveKey = Channel, so we maintain exactly 4 live rows.
+    /// Uses a single atomic statement to avoid race conditions.
+    /// </summary>
     private async Task UpsertLiveVectorAsync(
         DateTime ts,
         int channel,
@@ -247,52 +252,34 @@ namespace OdIsiIngestService
           DateTime.UtcNow - lastWriteUtc < LiveWriteInterval)
         return;
 
-      string updateSql = $@"
+      string upsertSql = $@"
 UPDATE {_cfg.LiveTableName}
-SET TimestampUtc = @ts,
-    Channel      = @ch,
-    GaugeCount   = @gc,
-    DataJson     = @json
-WHERE Channel = @ch;";
+   SET TimestampUtc = @ts,
+       GaugeCount   = @gc,
+       DataJson     = @json
+ WHERE LiveKey = @lk AND Channel = @ch;
 
-      string insertSql = $@"
-INSERT INTO {_cfg.LiveTableName}
-(TimestampUtc, Channel, GaugeCount, DataJson)
-VALUES
-(@ts, @ch, @gc, @json);";
+IF @@ROWCOUNT = 0
+  INSERT INTO {_cfg.LiveTableName}
+         (LiveKey, TimestampUtc, Channel, GaugeCount, DataJson)
+  VALUES (@lk, @ts, @ch, @gc, @json);";
 
       try
       {
         await using var conn = new SqlConnection(_cfg.SqlConnectionString);
         await conn.OpenAsync(ct);
 
-        await using (var cmd = new SqlCommand(updateSql, conn))
-        {
-          cmd.Parameters.AddWithValue("@ts", ts);
-          cmd.Parameters.AddWithValue("@ch", channel);
-          cmd.Parameters.AddWithValue("@gc", gaugeCount);
-          cmd.Parameters.AddWithValue("@json", json);
+        await using var cmd = new SqlCommand(upsertSql, conn);
+        cmd.Parameters.AddWithValue("@lk", channel);  // LiveKey = Channel
+        cmd.Parameters.AddWithValue("@ts", ts);
+        cmd.Parameters.AddWithValue("@ch", channel);
+        cmd.Parameters.AddWithValue("@gc", gaugeCount);
+        cmd.Parameters.AddWithValue("@json", json);
 
-          int rows = await cmd.ExecuteNonQueryAsync(ct);
-          if (rows > 0)
-          {
-            _lastLiveWriteByChannel[channel] = DateTime.UtcNow;
-            _logger.LogInformation("Updated live row for Channel={Channel}", channel);
-            return;
-          }
-        }
+        await cmd.ExecuteNonQueryAsync(ct);
+        _lastLiveWriteByChannel[channel] = DateTime.UtcNow;
 
-        await using (var cmd2 = new SqlCommand(insertSql, conn))
-        {
-          cmd2.Parameters.AddWithValue("@ts", ts);
-          cmd2.Parameters.AddWithValue("@ch", channel);
-          cmd2.Parameters.AddWithValue("@gc", gaugeCount);
-          cmd2.Parameters.AddWithValue("@json", json);
-
-          await cmd2.ExecuteNonQueryAsync(ct);
-          _lastLiveWriteByChannel[channel] = DateTime.UtcNow;
-          _logger.LogInformation("Inserted live row for Channel={Channel}", channel);
-        }
+        _logger.LogInformation("Upserted live row: Channel={Channel}, GaugeCount={GaugeCount}", channel, gaugeCount);
       }
       catch (Exception ex)
       {
