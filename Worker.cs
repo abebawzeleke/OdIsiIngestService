@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -28,8 +29,8 @@ namespace OdIsiIngestService
     private DateTime _lastHeartbeatUtc = DateTime.MinValue;
     private int _diagnosticFramesLogged = 0;
 
-    private readonly Dictionary<int, DateTime> _lastLiveWriteByChannel = new();
-    private readonly Dictionary<int, DateTime> _lastHistoryBucketByChannel = new();
+    private readonly ConcurrentDictionary<int, DateTime> _lastLiveWriteByChannel = new();
+    private readonly ConcurrentDictionary<int, DateTime> _lastHistoryBucketByChannel = new();
 
     private TimeSpan LiveWriteInterval =>
         TimeSpan.FromSeconds(_cfg.LiveWriteIntervalSeconds <= 0 ? 1 : _cfg.LiveWriteIntervalSeconds);
@@ -229,10 +230,33 @@ namespace OdIsiIngestService
         string vectorArrayJson = data.GetRawText();
 
         Interlocked.Increment(ref _measurements);
-        _logger.LogInformation("Accepted measurement frame for Channel={Channel}, GaugeCount={GaugeCount}", channel.Value, gaugeCount);
+        _logger.LogDebug("Accepted measurement frame for Channel={Channel}, GaugeCount={GaugeCount}", channel.Value, gaugeCount);
 
-        await UpsertLiveVectorAsync(ts, channel.Value, gaugeCount, vectorArrayJson, ct);
-        await InsertChannelHistoryIfNeededAsync(ts, channel.Value, gaugeCount, vectorArrayJson, ct);
+        // Share one SQL connection for both live upsert and history insert
+        bool needsLive = !_lastLiveWriteByChannel.TryGetValue(channel.Value, out var lastLive)
+                         || DateTime.UtcNow - lastLive >= LiveWriteInterval;
+        bool needsHistory = !_lastHistoryBucketByChannel.TryGetValue(channel.Value, out var lastBucket)
+                            || lastBucket != GetHistoryBucketStartUtc(ts);
+
+        if (needsLive || needsHistory)
+        {
+          try
+          {
+            await using var conn = new SqlConnection(_cfg.SqlConnectionString);
+            await conn.OpenAsync(ct);
+
+            if (needsLive)
+              await UpsertLiveVectorAsync(conn, ts, channel.Value, gaugeCount, vectorArrayJson, ct);
+
+            if (needsHistory)
+              await InsertChannelHistoryIfNeededAsync(conn, ts, channel.Value, gaugeCount, vectorArrayJson, ct);
+          }
+          catch (Exception ex)
+          {
+            _logger.LogError(ex, "SQL connection error for Channel={Channel}", channel.Value);
+            FileLog(ex.ToString());
+          }
+        }
       }
     }
 
@@ -242,16 +266,13 @@ namespace OdIsiIngestService
     /// Uses a single atomic statement to avoid race conditions.
     /// </summary>
     private async Task UpsertLiveVectorAsync(
+        SqlConnection conn,
         DateTime ts,
         int channel,
         int gaugeCount,
         string json,
         CancellationToken ct)
     {
-      if (_lastLiveWriteByChannel.TryGetValue(channel, out var lastWriteUtc) &&
-          DateTime.UtcNow - lastWriteUtc < LiveWriteInterval)
-        return;
-
       string upsertSql = $@"
 UPDATE {_cfg.LiveTableName}
    SET TimestampUtc = @ts,
@@ -266,9 +287,6 @@ IF @@ROWCOUNT = 0
 
       try
       {
-        await using var conn = new SqlConnection(_cfg.SqlConnectionString);
-        await conn.OpenAsync(ct);
-
         await using var cmd = new SqlCommand(upsertSql, conn);
         cmd.Parameters.AddWithValue("@lk", channel);  // LiveKey = Channel
         cmd.Parameters.AddWithValue("@ts", ts);
@@ -279,7 +297,7 @@ IF @@ROWCOUNT = 0
         await cmd.ExecuteNonQueryAsync(ct);
         _lastLiveWriteByChannel[channel] = DateTime.UtcNow;
 
-        _logger.LogInformation("Upserted live row: Channel={Channel}, GaugeCount={GaugeCount}", channel, gaugeCount);
+        _logger.LogDebug("Upserted live row: Channel={Channel}, GaugeCount={GaugeCount}", channel, gaugeCount);
       }
       catch (Exception ex)
       {
@@ -309,6 +327,7 @@ IF @@ROWCOUNT = 0
     }
 
     private async Task InsertChannelHistoryIfNeededAsync(
+        SqlConnection conn,
         DateTime ts,
         int channel,
         int gaugeCount,
@@ -316,11 +335,6 @@ IF @@ROWCOUNT = 0
         CancellationToken ct)
     {
       var bucketStart = GetHistoryBucketStartUtc(ts);
-
-      // Fast in-memory guard: most incoming messages for a channel will fall in the same history bucket.
-      if (_lastHistoryBucketByChannel.TryGetValue(channel, out var lastBucket) &&
-          lastBucket == bucketStart)
-        return;
 
       string insertSql = $@"
 IF NOT EXISTS (
@@ -338,9 +352,6 @@ END";
 
       try
       {
-        await using var conn = new SqlConnection(_cfg.SqlConnectionString);
-        await conn.OpenAsync(ct);
-
         await using var cmd = new SqlCommand(insertSql, conn);
         cmd.Parameters.AddWithValue("@bucketStart", bucketStart);
         cmd.Parameters.AddWithValue("@ts", ts);
