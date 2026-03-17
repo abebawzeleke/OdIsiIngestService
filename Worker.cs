@@ -215,7 +215,8 @@ namespace OdIsiIngestService
         if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
           return;
 
-        DateTime ts = TryGetTimestampUtc(root) ?? DateTime.UtcNow;
+        // Use server UTC time instead of sensor timestamp (ODiSI instrument clock is wrong)
+        DateTime ts = DateTime.UtcNow;
 
         int? channel = TryGetInt(root, "channel");
         if (!channel.HasValue || channel.Value < 1 || channel.Value > _cfg.ChannelCount)
