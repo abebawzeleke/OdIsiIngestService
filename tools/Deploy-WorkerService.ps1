@@ -140,14 +140,23 @@ try {
     Write-ColorOutput ("ExeName:     {0}" -f $ExeName) "Yellow"
 
     # --------------------------------------------------------
-    # Step 0: Git pull latest code
+    # Step 0: Git pull latest code (auto-stash local changes)
     # --------------------------------------------------------
     Write-ColorOutput "`nStep 0: Pull latest code..." "Cyan"
     Push-Location $ProjectDir
+
+    # Stash any local changes (e.g. appsettings.json edits) so pull never fails
+    $stashOutput = & git stash 2>&1 | Out-String
+    $didStash = $stashOutput -match "Saved working directory"
+    if ($didStash) {
+        Write-ColorOutput "Stashed local changes." "Yellow"
+    }
+
     $gitOutput = & git pull origin main 2>&1 | Out-String
     $gitExitCode = $LASTEXITCODE
     Write-ColorOutput $gitOutput.Trim() "Gray"
     if ($gitExitCode -ne 0) { Pop-Location; throw "git pull failed (exit code $gitExitCode)." }
+
     Pop-Location
     Write-ColorOutput "Code updated." "Green"
 
