@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Hosting;
@@ -22,6 +23,7 @@ namespace OdIsiIngestService
     private readonly string _logDir = @"C:\ProgramData\OilTank";
     private readonly string _logFile;
 
+    // ── Stats ──
     private long _bytesRead;
     private long _framesFound;
     private long _jsonParsed;
@@ -29,18 +31,31 @@ namespace OdIsiIngestService
     private DateTime _lastHeartbeatUtc = DateTime.MinValue;
     private int _diagnosticFramesLogged = 0;
 
+    // ── Throttle tracking ──
     private readonly ConcurrentDictionary<int, DateTime> _lastLiveWriteByChannel = new();
     private readonly ConcurrentDictionary<int, DateTime> _lastHistoryBucketByChannel = new();
 
     private TimeSpan LiveWriteInterval =>
         TimeSpan.FromSeconds(_cfg.LiveWriteIntervalSeconds <= 0 ? 1 : _cfg.LiveWriteIntervalSeconds);
 
-    // JSON framing state copied from the old working oil-tank ingest path
+    // ── Per-channel latest frame (writer always gets newest data) ──
+    private readonly ConcurrentDictionary<int, MeasurementFrame> _latestFrameByChannel = new();
+
+    // ── Signal channel: writer wakes up when any channel has new data ──
+    private readonly Channel<int> _writerSignal = Channel.CreateBounded<int>(
+        new BoundedChannelOptions(64)
+        {
+          FullMode = BoundedChannelFullMode.DropOldest,
+          SingleReader = true,
+          SingleWriter = false
+        });
+
+    // ── JSON framing state ──
     private bool _inJson = false;
     private bool _inString = false;
     private bool _escape = false;
     private int _depth = 0;
-    private readonly StringBuilder _jsonSb = new(256 * 1024);
+    private readonly StringBuilder _jsonSb = new(512 * 1024);
 
     public Worker(ILogger<Worker> logger, OdIsiConfig cfg)
     {
@@ -57,6 +72,10 @@ namespace OdIsiIngestService
 
       await StartDebugHttpServer(stoppingToken);
 
+      // Launch the SQL writer as a background task
+      var writerTask = Task.Run(() => SqlWriterLoopAsync(stoppingToken), stoppingToken);
+
+      // TCP reader loop (main loop — never blocks on SQL)
       while (!stoppingToken.IsCancellationRequested)
       {
         try
@@ -64,6 +83,7 @@ namespace OdIsiIngestService
           LogBoth($"CONNECTING host={_cfg.Host} port={_cfg.Port}");
 
           using var client = new TcpClient();
+          client.ReceiveBufferSize = 256 * 1024; // 256KB OS-level TCP receive buffer
 
           using (var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken))
           {
@@ -75,14 +95,14 @@ namespace OdIsiIngestService
 
           LogBoth($"CONNECTED to ODiSI {_cfg.Host}:{_cfg.Port}");
 
-          // Try the most likely ODiSI command variant for this firmware.
           await TrySendStartCommandAsync(net, "{\"command\":\"measurements start\"}\n", stoppingToken);
 
-          var readBuf = new byte[8192];
+          // 64KB read buffer (was 8KB — each frame is ~400KB so bigger buffer = fewer reads)
+          var readBuf = new byte[65536];
 
           while (!stoppingToken.IsCancellationRequested)
           {
-            int n = await net.ReadAsync(readBuf, 0, readBuf.Length, stoppingToken);
+            int n = await net.ReadAsync(readBuf.AsMemory(0, readBuf.Length), stoppingToken);
 
             if (n == 0)
             {
@@ -92,12 +112,13 @@ namespace OdIsiIngestService
 
             _bytesRead += n;
 
+            // Extract JSON frames and queue them — NO SQL here
             for (int i = 0; i < n; i++)
             {
               if (TryExtractJsonFrame((char)readBuf[i], out var frame))
               {
                 _framesFound++;
-                await ProcessVectorMessageAsync(frame, stoppingToken);
+                ParseAndEnqueueFrame(frame);
               }
             }
 
@@ -114,7 +135,7 @@ namespace OdIsiIngestService
         }
         catch (Exception ex)
         {
-          LogBoth("ERROR ingest loop crashed: " + ex);
+          LogBoth("ERROR tcp reader loop: " + ex);
         }
 
         try
@@ -127,28 +148,20 @@ namespace OdIsiIngestService
         }
       }
 
-      LogBoth("STOP");
+      LogBoth("STOP — waiting for writer to finish");
+
+      _writerSignal.Writer.TryComplete();
+      try { await writerTask; } catch { }
+
+      LogBoth("STOP complete");
     }
 
-    private async Task<bool> TrySendStartCommandAsync(NetworkStream net, string commandText, CancellationToken ct)
-    {
-      try
-      {
-        var cmdBytes = Encoding.UTF8.GetBytes(commandText);
-        await net.WriteAsync(cmdBytes, 0, cmdBytes.Length, ct);
-        await net.FlushAsync(ct);
+    // ══════════════════════════════════════════════════════════════
+    //  TCP-side: parse JSON frame and store latest per channel.
+    //  This NEVER touches SQL — runs entirely in the read loop.
+    // ══════════════════════════════════════════════════════════════
 
-        LogBoth($"Sent ODiSI command: {commandText.Replace("\r", "\\r").Replace("\n", "\\n")}");
-        return true;
-      }
-      catch (Exception ex)
-      {
-        _logger.LogError(ex, "Failed sending ODiSI command: {Command}", commandText);
-        return false;
-      }
-    }
-
-    private async Task ProcessVectorMessageAsync(string json, CancellationToken ct)
+    private void ParseAndEnqueueFrame(string json)
     {
       JsonDocument doc;
       try
@@ -170,42 +183,11 @@ namespace OdIsiIngestService
         if (_diagnosticFramesLogged < 10)
         {
           _diagnosticFramesLogged++;
-
-          string preview = json.Length > 1000 ? json[..1000] : json;
-
-          bool hasData = root.TryGetProperty("data", out var dbgData) && dbgData.ValueKind == JsonValueKind.Array;
-          int? dbgChannel = TryGetInt(root, "channel");
-
-          string? dbgMessageType = null;
-          if (root.TryGetProperty("message type", out var dbgMt1) && dbgMt1.ValueKind == JsonValueKind.String)
-            dbgMessageType = dbgMt1.GetString();
-          else if (root.TryGetProperty("message_type", out var dbgMt2) && dbgMt2.ValueKind == JsonValueKind.String)
-            dbgMessageType = dbgMt2.GetString();
-          else if (root.TryGetProperty("messageType", out var dbgMt3) && dbgMt3.ValueKind == JsonValueKind.String)
-            dbgMessageType = dbgMt3.GetString();
-
-          _logger.LogWarning(
-              "ODiSI diagnostic frame #{FrameNo}: messageType={MessageType}, hasData={HasData}, channel={Channel}, preview={Preview}",
-              _diagnosticFramesLogged,
-              dbgMessageType ?? "<none>",
-              hasData,
-              dbgChannel,
-              preview);
+          LogDiagnosticFrame(root, json);
         }
 
-        // Accept vendor variations of message type if present, but do not require it.
-        // Some ODiSI payloads only contain { "channel": N, "data": [...] } with no message type.
-        string? messageType = null;
-
-        if (root.TryGetProperty("message type", out var mt1) && mt1.ValueKind == JsonValueKind.String)
-          messageType = mt1.GetString();
-        else if (root.TryGetProperty("message_type", out var mt2) && mt2.ValueKind == JsonValueKind.String)
-          messageType = mt2.GetString();
-        else if (root.TryGetProperty("messageType", out var mt3) && mt3.ValueKind == JsonValueKind.String)
-          messageType = mt3.GetString();
-
-        // If a message type is provided and it is not "measurement", skip it.
-        // If message type is missing, still allow the frame as long as it has data[].
+        // Check message type
+        string? messageType = GetMessageType(root);
         if (!string.IsNullOrWhiteSpace(messageType) &&
             !string.Equals(messageType, "measurement", StringComparison.OrdinalIgnoreCase))
         {
@@ -215,9 +197,6 @@ namespace OdIsiIngestService
         if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
           return;
 
-        // Use server UTC time instead of sensor timestamp (ODiSI instrument clock is wrong)
-        DateTime ts = DateTime.UtcNow;
-
         int? channel = TryGetInt(root, "channel");
         if (!channel.HasValue || channel.Value < 1 || channel.Value > _cfg.ChannelCount)
         {
@@ -226,46 +205,115 @@ namespace OdIsiIngestService
         }
 
         int gaugeCount = data.GetArrayLength();
-
-        // Store just the vector array JSON: [1,2,3,...]
         string vectorArrayJson = data.GetRawText();
 
         Interlocked.Increment(ref _measurements);
-        _logger.LogDebug("Accepted measurement frame for Channel={Channel}, GaugeCount={GaugeCount}", channel.Value, gaugeCount);
 
-        // Share one SQL connection for both live upsert and history insert
-        bool needsLive = !_lastLiveWriteByChannel.TryGetValue(channel.Value, out var lastLive)
-                         || DateTime.UtcNow - lastLive >= LiveWriteInterval;
-        bool needsHistory = !_lastHistoryBucketByChannel.TryGetValue(channel.Value, out var lastBucket)
-                            || lastBucket != GetHistoryBucketStartUtc(ts);
-
-        if (needsLive || needsHistory)
+        // Store the latest frame for this channel (overwrites previous if writer hasn't consumed it yet)
+        var mf = new MeasurementFrame
         {
-          try
-          {
-            await using var conn = new SqlConnection(_cfg.SqlConnectionString);
-            await conn.OpenAsync(ct);
+          Channel = channel.Value,
+          GaugeCount = gaugeCount,
+          DataJson = vectorArrayJson,
+          ReceivedUtc = DateTime.UtcNow
+        };
 
-            if (needsLive)
-              await UpsertLiveVectorAsync(conn, ts, channel.Value, gaugeCount, vectorArrayJson, ct);
+        _latestFrameByChannel[channel.Value] = mf;
 
-            if (needsHistory)
-              await InsertChannelHistoryIfNeededAsync(conn, ts, channel.Value, gaugeCount, vectorArrayJson, ct);
-          }
-          catch (Exception ex)
-          {
-            _logger.LogError(ex, "SQL connection error for Channel={Channel}", channel.Value);
-            FileLog(ex.ToString());
-          }
-        }
+        // Signal the writer that channel N has new data
+        _writerSignal.Writer.TryWrite(channel.Value);
       }
     }
 
-    /// <summary>
-    /// Upserts one row per channel into OdIsiLiveVector.
-    /// LiveKey = Channel, so we maintain exactly 4 live rows.
-    /// Uses a single atomic statement to avoid race conditions.
-    /// </summary>
+    // ══════════════════════════════════════════════════════════════
+    //  SQL Writer: runs on a separate task, never blocks TCP reads.
+    //  Uses a persistent SQL connection with auto-reconnect.
+    // ══════════════════════════════════════════════════════════════
+
+    private async Task SqlWriterLoopAsync(CancellationToken ct)
+    {
+      LogBoth("SQL writer started");
+
+      SqlConnection? conn = null;
+
+      try
+      {
+        await foreach (var channelSignal in _writerSignal.Reader.ReadAllAsync(ct))
+        {
+          // Grab the latest frame for this channel
+          if (!_latestFrameByChannel.TryGetValue(channelSignal, out var frame))
+            continue;
+
+          var ts = frame.ReceivedUtc;
+          var channel = frame.Channel;
+
+          bool needsLive = !_lastLiveWriteByChannel.TryGetValue(channel, out var lastLive)
+                           || DateTime.UtcNow - lastLive >= LiveWriteInterval;
+          bool needsHistory = !_lastHistoryBucketByChannel.TryGetValue(channel, out var lastBucket)
+                              || lastBucket != GetHistoryBucketStartUtc(ts);
+
+          if (!needsLive && !needsHistory)
+            continue;
+
+          try
+          {
+            // Reuse connection or reconnect
+            conn = await EnsureConnectionAsync(conn, ct);
+
+            if (needsLive)
+              await UpsertLiveVectorAsync(conn, ts, channel, frame.GaugeCount, frame.DataJson, ct);
+
+            if (needsHistory)
+              await InsertChannelHistoryIfNeededAsync(conn, ts, channel, frame.GaugeCount, frame.DataJson, ct);
+          }
+          catch (SqlException ex)
+          {
+            _logger.LogError(ex, "SQL error for Channel={Channel}, will reconnect", channel);
+            FileLog(ex.ToString());
+            TryDisposeConnection(ref conn);
+          }
+          catch (Exception ex)
+          {
+            _logger.LogError(ex, "Writer error for Channel={Channel}", channel);
+            FileLog(ex.ToString());
+            TryDisposeConnection(ref conn);
+          }
+        }
+      }
+      catch (OperationCanceledException) { }
+      catch (Exception ex)
+      {
+        LogBoth("ERROR SQL writer loop crashed: " + ex);
+      }
+      finally
+      {
+        TryDisposeConnection(ref conn);
+        LogBoth("SQL writer stopped");
+      }
+    }
+
+    private async Task<SqlConnection> EnsureConnectionAsync(SqlConnection? conn, CancellationToken ct)
+    {
+      if (conn?.State == System.Data.ConnectionState.Open)
+        return conn;
+
+      TryDisposeConnection(ref conn!);
+
+      var newConn = new SqlConnection(_cfg.SqlConnectionString);
+      await newConn.OpenAsync(ct);
+      return newConn;
+    }
+
+    private void TryDisposeConnection(ref SqlConnection? conn)
+    {
+      try { conn?.Dispose(); } catch { }
+      conn = null;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  SQL operations (same upsert/insert logic as before)
+    // ══════════════════════════════════════════════════════════════
+
     private async Task UpsertLiveVectorAsync(
         SqlConnection conn,
         DateTime ts,
@@ -289,7 +337,7 @@ IF @@ROWCOUNT = 0
       try
       {
         await using var cmd = new SqlCommand(upsertSql, conn);
-        cmd.Parameters.AddWithValue("@lk", channel);  // LiveKey = Channel
+        cmd.Parameters.AddWithValue("@lk", channel);
         cmd.Parameters.AddWithValue("@ts", ts);
         cmd.Parameters.AddWithValue("@ch", channel);
         cmd.Parameters.AddWithValue("@gc", gaugeCount);
@@ -303,7 +351,7 @@ IF @@ROWCOUNT = 0
       catch (Exception ex)
       {
         _logger.LogError(ex, "Failed to upsert live vector for Channel={Channel}", channel);
-        FileLog(ex.ToString());
+        throw; // Let writer loop handle reconnect
       }
     }
 
@@ -315,7 +363,6 @@ IF @@ROWCOUNT = 0
           ? 60
           : _cfg.HistoryWriteIntervalSeconds;
 
-      // Total seconds since start of day, floored to interval
       int totalSeconds = tsUtc.Hour * 3600 + tsUtc.Minute * 60 + tsUtc.Second;
       int bucketSeconds = (totalSeconds / intervalSeconds) * intervalSeconds;
 
@@ -370,9 +417,13 @@ END";
             ex,
             "Failed to save history row for Channel={Channel}, BucketStart={BucketStart}",
             channel, bucketStart);
-        FileLog(ex.ToString());
+        throw; // Let writer loop handle reconnect
       }
     }
+
+    // ══════════════════════════════════════════════════════════════
+    //  JSON frame extraction (unchanged)
+    // ══════════════════════════════════════════════════════════════
 
     private bool TryExtractJsonFrame(char ch, out string json)
     {
@@ -442,6 +493,10 @@ END";
       return false;
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  Debug HTTP server (unchanged)
+    // ══════════════════════════════════════════════════════════════
+
     private async Task StartDebugHttpServer(CancellationToken ct)
     {
       var listener = new HttpListener();
@@ -479,8 +534,8 @@ END";
                 });
               }
 
-              var json = JsonSerializer.Serialize(rows);
-              var buffer = Encoding.UTF8.GetBytes(json);
+              var jsonResp = JsonSerializer.Serialize(rows);
+              var buffer = Encoding.UTF8.GetBytes(jsonResp);
 
               ctx.Response.ContentType = "application/json";
               await ctx.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length, ct);
@@ -505,6 +560,28 @@ END";
       }, ct);
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  Helpers
+    // ══════════════════════════════════════════════════════════════
+
+    private async Task<bool> TrySendStartCommandAsync(NetworkStream net, string commandText, CancellationToken ct)
+    {
+      try
+      {
+        var cmdBytes = Encoding.UTF8.GetBytes(commandText);
+        await net.WriteAsync(cmdBytes, 0, cmdBytes.Length, ct);
+        await net.FlushAsync(ct);
+
+        LogBoth($"Sent ODiSI command: {commandText.Replace("\r", "\\r").Replace("\n", "\\n")}");
+        return true;
+      }
+      catch (Exception ex)
+      {
+        _logger.LogError(ex, "Failed sending ODiSI command: {Command}", commandText);
+        return false;
+      }
+    }
+
     private void HeartbeatIfNeeded()
     {
       var now = DateTime.UtcNow;
@@ -512,6 +589,34 @@ END";
       _lastHeartbeatUtc = now;
 
       LogBoth($"HB bytes={_bytesRead} frames={_framesFound} parsed={_jsonParsed} meas={_measurements}");
+    }
+
+    private static string? GetMessageType(JsonElement root)
+    {
+      if (root.TryGetProperty("message type", out var mt1) && mt1.ValueKind == JsonValueKind.String)
+        return mt1.GetString();
+      if (root.TryGetProperty("message_type", out var mt2) && mt2.ValueKind == JsonValueKind.String)
+        return mt2.GetString();
+      if (root.TryGetProperty("messageType", out var mt3) && mt3.ValueKind == JsonValueKind.String)
+        return mt3.GetString();
+      return null;
+    }
+
+    private void LogDiagnosticFrame(JsonElement root, string json)
+    {
+      string preview = json.Length > 1000 ? json[..1000] : json;
+
+      bool hasData = root.TryGetProperty("data", out var dbgData) && dbgData.ValueKind == JsonValueKind.Array;
+      int? dbgChannel = TryGetInt(root, "channel");
+      string? dbgMessageType = GetMessageType(root);
+
+      _logger.LogWarning(
+          "ODiSI diagnostic frame #{FrameNo}: messageType={MessageType}, hasData={HasData}, channel={Channel}, preview={Preview}",
+          _diagnosticFramesLogged,
+          dbgMessageType ?? "<none>",
+          hasData,
+          dbgChannel,
+          preview);
     }
 
     private static int GetInt(JsonElement root, string name) =>
@@ -522,28 +627,6 @@ END";
       if (root.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.Number)
         return el.GetInt32();
       return null;
-    }
-
-    private static DateTime? TryGetTimestampUtc(JsonElement root)
-    {
-      int year = GetInt(root, "year");
-      if (year <= 0) return null;
-
-      int month = GetInt(root, "month");
-      int day = GetInt(root, "day");
-      int hour = GetInt(root, "hours");
-      int min = GetInt(root, "minutes");
-      int sec = GetInt(root, "seconds");
-      int ms = GetInt(root, "milliseconds");
-
-      try
-      {
-        return new DateTime(year, month, day, hour, min, sec, ms, DateTimeKind.Utc);
-      }
-      catch
-      {
-        return null;
-      }
     }
 
     private void EnsureLogFolder()
@@ -568,6 +651,18 @@ END";
       {
         // never throw from logging
       }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  Data transfer object for per-channel latest frame
+    // ══════════════════════════════════════════════════════════════
+
+    private sealed class MeasurementFrame
+    {
+      public int Channel;
+      public int GaugeCount;
+      public string DataJson = "";
+      public DateTime ReceivedUtc;
     }
   }
 }
