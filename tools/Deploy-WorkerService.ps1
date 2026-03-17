@@ -146,15 +146,18 @@ try {
     Push-Location $ProjectDir
 
     # Stash any local changes (e.g. appsettings.json edits) so pull never fails
-    $stashOutput = & git stash 2>&1 | Out-String
-    $didStash = $stashOutput -match "Saved working directory"
+    # Use cmd /c to prevent PowerShell 5.1 from treating git stderr as errors
+    $ErrorActionPreference = "Continue"
+    $stashOutput = cmd /c "git stash 2>&1"
+    $didStash = ($stashOutput | Out-String) -match "Saved working directory"
     if ($didStash) {
         Write-ColorOutput "Stashed local changes." "Yellow"
     }
 
-    $gitOutput = & git pull origin main 2>&1 | Out-String
+    $gitOutput = cmd /c "git pull origin main 2>&1"
     $gitExitCode = $LASTEXITCODE
-    Write-ColorOutput $gitOutput.Trim() "Gray"
+    $ErrorActionPreference = "Stop"
+    if ($gitOutput) { Write-ColorOutput ($gitOutput -join "`n") "Gray" }
     if ($gitExitCode -ne 0) { Pop-Location; throw "git pull failed (exit code $gitExitCode)." }
 
     Pop-Location
