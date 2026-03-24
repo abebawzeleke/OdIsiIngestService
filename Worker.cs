@@ -85,21 +85,23 @@ namespace OdIsiIngestService
       // Launch the SQL writer as a background task
       var writerTask = Task.Run(() => SqlWriterLoopAsync(stoppingToken), stoppingToken);
 
-      // TCP reader loop — continuous drain approach.
+      // TCP reader loop — connect/read/disconnect polling approach.
       //
-      // Read from the controller as fast as possible so it never buffers
-      // data internally. The reader-side throttle (ShouldAcceptFrame)
-      // discards frames we don't need — zero-alloc for skipped frames
-      // thanks to Utf8JsonReader on the raw byte buffer.
+      // The ODiSI controller starts streaming the moment a client connects
+      // and sends any command. It only supports one TCP client at a time.
+      // Keeping a persistent connection causes ~1.6 GB/hr memory growth on
+      // the controller regardless of how fast we drain.
       //
-      // This keeps the controller's send path clear: it writes, we read,
-      // nobody blocks, nothing accumulates.
+      // Strategy: connect → read until all channels collected → disconnect.
+      // Wait for the poll interval, then repeat. Each session is short-lived
+      // (~2-5 seconds), giving the controller no time to accumulate state.
       while (!stoppingToken.IsCancellationRequested)
       {
+        var pollChannelsReceived = new HashSet<int>();
+        var pollStartUtc = DateTime.UtcNow;
+
         try
         {
-          LogBoth($"CONNECTING host={_cfg.Host} port={_cfg.Port}");
-
           using var client = new TcpClient();
           client.ReceiveBufferSize = 256 * 1024;
 
@@ -111,24 +113,39 @@ namespace OdIsiIngestService
 
           using var net = client.GetStream();
 
-          LogBoth($"CONNECTED to ODiSI {_cfg.Host}:{_cfg.Port}");
-
-          // Send start ONCE for the lifetime of this connection
+          // Send any command to trigger data flow
           await TrySendStartCommandAsync(net, "{\"command\":\"measurements start\"}\n", stoppingToken);
 
-          // 64KB read buffer
+          // Reset frame parser state for this fresh connection
+          _inJson = false;
+          _inString = false;
+          _escape = false;
+          _depth = 0;
+          _frameBufLen = 0;
+
           var readBuf = new byte[65536];
+          var readTimeout = TimeSpan.FromSeconds(30);
 
-          // ── Continuous read loop: never pause, keep the TCP pipe drained ──
-          while (!stoppingToken.IsCancellationRequested)
+          // Read until we have all channels or timeout
+          while (!stoppingToken.IsCancellationRequested
+                 && pollChannelsReceived.Count < _cfg.ChannelCount
+                 && DateTime.UtcNow - pollStartUtc < readTimeout)
           {
-            int n = await net.ReadAsync(readBuf.AsMemory(0, readBuf.Length), stoppingToken);
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            readCts.CancelAfter(TimeSpan.FromSeconds(5));
 
-            if (n == 0)
+            int n;
+            try
             {
-              LogBoth("ODiSI closed connection -> reconnecting");
-              goto Reconnect;
+              n = await net.ReadAsync(readBuf.AsMemory(0, readBuf.Length), readCts.Token);
             }
+            catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+            {
+              // Individual read timed out — controller may be slow, keep trying
+              continue;
+            }
+
+            if (n == 0) break; // connection closed
 
             _bytesRead += n;
 
@@ -137,12 +154,14 @@ namespace OdIsiIngestService
               if (TryExtractJsonFrame(readBuf[i]))
               {
                 _framesFound++;
-                ParseAndEnqueueFrame(); // throttle decides whether to keep or discard
+                int? ch = ParseAndEnqueueFrame();
+                if (ch.HasValue)
+                  pollChannelsReceived.Add(ch.Value);
               }
             }
-
-            HeartbeatIfNeeded();
           }
+
+          // Connection disposes here (using statement) — clean disconnect
         }
         catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
         {
@@ -157,11 +176,18 @@ namespace OdIsiIngestService
           LogBoth("ERROR tcp reader loop: " + ex);
         }
 
-        Reconnect:
+        var elapsed = DateTime.UtcNow - pollStartUtc;
+        LogBoth($"Poll cycle: {pollChannelsReceived.Count}/{_cfg.ChannelCount} channels in {elapsed.TotalMilliseconds:F0}ms");
+        HeartbeatIfNeeded();
+
+        // Sleep for the remainder of the poll interval
+        var sleepTime = LiveWriteInterval - elapsed;
+        if (sleepTime < TimeSpan.FromMilliseconds(500))
+          sleepTime = TimeSpan.FromMilliseconds(500);
 
         try
         {
-          await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+          await Task.Delay(sleepTime, stoppingToken);
         }
         catch
         {
