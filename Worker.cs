@@ -85,22 +85,15 @@ namespace OdIsiIngestService
       // Launch the SQL writer as a background task
       var writerTask = Task.Run(() => SqlWriterLoopAsync(stoppingToken), stoppingToken);
 
-      // TCP reader loop — persistent connection with TCP backpressure.
+      // TCP reader loop — continuous drain approach.
       //
-      // Instead of start/stop cycling (which depends on controller latency),
-      // we keep a single streaming session and use TCP flow control:
+      // Read from the controller as fast as possible so it never buffers
+      // data internally. The reader-side throttle (ShouldAcceptFrame)
+      // discards frames we don't need — zero-alloc for skipped frames
+      // thanks to Utf8JsonReader on the raw byte buffer.
       //
-      //  1. Connect + send "measurements start" once
-      //  2. READ phase:  read until every channel has a frame
-      //  3. PAUSE phase: stop calling ReadAsync for the write interval.
-      //     Our 256KB receive buffer fills in ~12ms, TCP advertises window=0,
-      //     the controller's write() blocks → it stops generating data.
-      //  4. RESUME: call ReadAsync again. TCP window opens, fresh data flows.
-      //     Discard the ~256KB of stale buffered data, then collect fresh frames.
-      //  5. goto 2
-      //
-      // This is a transport-layer guarantee — no timing heuristics, no burst
-      // windows, and works regardless of the controller's application logic.
+      // This keeps the controller's send path clear: it writes, we read,
+      // nobody blocks, nothing accumulates.
       while (!stoppingToken.IsCancellationRequested)
       {
         try
@@ -108,7 +101,7 @@ namespace OdIsiIngestService
           LogBoth($"CONNECTING host={_cfg.Host} port={_cfg.Port}");
 
           using var client = new TcpClient();
-          client.ReceiveBufferSize = 256 * 1024; // 256KB OS-level TCP receive buffer
+          client.ReceiveBufferSize = 256 * 1024;
 
           using (var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken))
           {
@@ -123,71 +116,32 @@ namespace OdIsiIngestService
           // Send start ONCE for the lifetime of this connection
           await TrySendStartCommandAsync(net, "{\"command\":\"measurements start\"}\n", stoppingToken);
 
-          // 64KB read buffer (each frame is ~400KB so bigger buffer = fewer reads)
+          // 64KB read buffer
           var readBuf = new byte[65536];
 
+          // ── Continuous read loop: never pause, keep the TCP pipe drained ──
           while (!stoppingToken.IsCancellationRequested)
           {
-            // ── READ PHASE: collect one frame per channel ──
-            var channelsReceived = new HashSet<int>();
-            var readStart = DateTime.UtcNow;
+            int n = await net.ReadAsync(readBuf.AsMemory(0, readBuf.Length), stoppingToken);
 
-            // Safety timeout: if we can't get all channels in 30s, something is wrong
-            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-            readCts.CancelAfter(TimeSpan.FromSeconds(30));
-
-            try
+            if (n == 0)
             {
-              while (!readCts.Token.IsCancellationRequested)
+              LogBoth("ODiSI closed connection -> reconnecting");
+              goto Reconnect;
+            }
+
+            _bytesRead += n;
+
+            for (int i = 0; i < n; i++)
+            {
+              if (TryExtractJsonFrame(readBuf[i]))
               {
-                int n = await net.ReadAsync(readBuf.AsMemory(0, readBuf.Length), readCts.Token);
-
-                if (n == 0)
-                {
-                  LogBoth("ODiSI closed connection -> reconnecting");
-                  goto Reconnect;
-                }
-
-                _bytesRead += n;
-
-                for (int i = 0; i < n; i++)
-                {
-                  if (TryExtractJsonFrame(readBuf[i]))
-                  {
-                    _framesFound++;
-                    int? ch = ParseAndEnqueueFrame();
-                    if (ch.HasValue)
-                      channelsReceived.Add(ch.Value);
-                  }
-                }
-
-                HeartbeatIfNeeded();
-
-                if (channelsReceived.Count >= _cfg.ChannelCount)
-                  break;
+                _framesFound++;
+                ParseAndEnqueueFrame(); // throttle decides whether to keep or discard
               }
             }
-            catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
-            {
-              LogBoth($"Read phase timeout: got {channelsReceived.Count}/{_cfg.ChannelCount} channels in 30s");
-            }
 
-            var readElapsed = DateTime.UtcNow - readStart;
-            LogBoth($"Read phase: {channelsReceived.Count}/{_cfg.ChannelCount} channels in {readElapsed.TotalMilliseconds:F0}ms");
-
-            // ── PAUSE PHASE: stop reading → TCP backpressure throttles the controller ──
-            // The controller's send buffer + our receive buffer (~512KB total) fills up,
-            // TCP window goes to 0, and the controller's write() blocks. No data is
-            // generated or buffered on the controller during this time.
-            var sleepTime = LiveWriteInterval - readElapsed;
-            if (sleepTime > TimeSpan.FromMilliseconds(100))
-              await Task.Delay(sleepTime, stoppingToken);
-
-            // ── RESUME: drain stale buffered data before next read phase ──
-            // After the pause, up to ~256KB of data sits in our receive buffer
-            // (sent just before the TCP window closed). Drain it so the next
-            // read phase gets fresh frames.
-            await DrainStaleDataAsync(net, readBuf, stoppingToken);
+            HeartbeatIfNeeded();
           }
         }
         catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
@@ -622,49 +576,6 @@ END";
       _frameBuf[_frameBufLen++] = b;
     }
 
-    /// <summary>
-    /// After the pause phase, drain stale bytes sitting in the TCP receive
-    /// buffer so the next read phase gets fresh frames. Uses DataAvailable
-    /// to read only what's already buffered (no blocking).
-    /// </summary>
-    private async Task DrainStaleDataAsync(NetworkStream net, byte[] buf, CancellationToken ct)
-    {
-      long drained = 0;
-
-      try
-      {
-        // Read whatever is already in the OS receive buffer (non-blocking check)
-        while (net.DataAvailable)
-        {
-          // Short timeout — we're just draining what's buffered, not waiting for new data
-          using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-          drainCts.CancelAfter(200);
-
-          int n = await net.ReadAsync(buf.AsMemory(0, buf.Length), drainCts.Token);
-          if (n == 0) break;
-          drained += n;
-        }
-      }
-      catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-      {
-        // Drain timeout — fine
-      }
-      catch
-      {
-        // Connection issue — next read will trigger reconnect
-      }
-
-      // Reset JSON framing state so partial frames from the stale data
-      // don't corrupt the next read phase
-      _inJson = false;
-      _frameBufLen = 0;
-      _depth = 0;
-      _inString = false;
-      _escape = false;
-
-      if (drained > 0)
-        LogBoth($"Drained {drained} stale bytes after pause");
-    }
 
     // ══════════════════════════════════════════════════════════════
     //  Debug HTTP server (unchanged)
