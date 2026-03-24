@@ -1,9 +1,10 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -28,6 +29,7 @@ namespace OdIsiIngestService
     private long _framesFound;
     private long _jsonParsed;
     private long _measurements;
+    private long _framesSkipped;
     private DateTime _lastHeartbeatUtc = DateTime.MinValue;
     private int _diagnosticFramesLogged = 0;
 
@@ -41,6 +43,9 @@ namespace OdIsiIngestService
     // ── Per-channel latest frame (writer always gets newest data) ──
     private readonly ConcurrentDictionary<int, MeasurementFrame> _latestFrameByChannel = new();
 
+    // ── Reader-side throttle: accept at most one frame per channel per interval ──
+    private readonly ConcurrentDictionary<int, DateTime> _lastAcceptedByChannel = new();
+
     // ── Signal channel: writer wakes up when any channel has new data ──
     private readonly Channel<int> _writerSignal = Channel.CreateBounded<int>(
         new BoundedChannelOptions(64)
@@ -50,12 +55,14 @@ namespace OdIsiIngestService
           SingleWriter = false
         });
 
-    // ── JSON framing state ──
+    // ── JSON framing state (byte buffer instead of StringBuilder to avoid LOH string allocations) ──
     private bool _inJson = false;
     private bool _inString = false;
     private bool _escape = false;
     private int _depth = 0;
-    private readonly StringBuilder _jsonSb = new(512 * 1024);
+    private byte[] _frameBuf = new byte[512 * 1024];
+    private int _frameBufLen = 0;
+    private const int MaxFrameSize = 2_000_000;
 
     public Worker(ILogger<Worker> logger, OdIsiConfig cfg)
     {
@@ -68,6 +75,9 @@ namespace OdIsiIngestService
     {
       EnsureLogFolder();
 
+      // Hint GC to compact the LOH periodically to reclaim fragmented memory
+      GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+
       LogBoth($"START build={GetType().Assembly.GetName().Version} host={_cfg.Host} port={_cfg.Port}");
 
       await StartDebugHttpServer(stoppingToken);
@@ -75,7 +85,22 @@ namespace OdIsiIngestService
       // Launch the SQL writer as a background task
       var writerTask = Task.Run(() => SqlWriterLoopAsync(stoppingToken), stoppingToken);
 
-      // TCP reader loop (main loop — never blocks on SQL)
+      // TCP reader loop — persistent connection with TCP backpressure.
+      //
+      // Instead of start/stop cycling (which depends on controller latency),
+      // we keep a single streaming session and use TCP flow control:
+      //
+      //  1. Connect + send "measurements start" once
+      //  2. READ phase:  read until every channel has a frame
+      //  3. PAUSE phase: stop calling ReadAsync for the write interval.
+      //     Our 256KB receive buffer fills in ~12ms, TCP advertises window=0,
+      //     the controller's write() blocks → it stops generating data.
+      //  4. RESUME: call ReadAsync again. TCP window opens, fresh data flows.
+      //     Discard the ~256KB of stale buffered data, then collect fresh frames.
+      //  5. goto 2
+      //
+      // This is a transport-layer guarantee — no timing heuristics, no burst
+      // windows, and works regardless of the controller's application logic.
       while (!stoppingToken.IsCancellationRequested)
       {
         try
@@ -95,34 +120,74 @@ namespace OdIsiIngestService
 
           LogBoth($"CONNECTED to ODiSI {_cfg.Host}:{_cfg.Port}");
 
+          // Send start ONCE for the lifetime of this connection
           await TrySendStartCommandAsync(net, "{\"command\":\"measurements start\"}\n", stoppingToken);
 
-          // 64KB read buffer (was 8KB — each frame is ~400KB so bigger buffer = fewer reads)
+          // 64KB read buffer (each frame is ~400KB so bigger buffer = fewer reads)
           var readBuf = new byte[65536];
 
           while (!stoppingToken.IsCancellationRequested)
           {
-            int n = await net.ReadAsync(readBuf.AsMemory(0, readBuf.Length), stoppingToken);
+            // ── READ PHASE: collect one frame per channel ──
+            var channelsReceived = new HashSet<int>();
+            var readStart = DateTime.UtcNow;
 
-            if (n == 0)
+            // Safety timeout: if we can't get all channels in 30s, something is wrong
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            readCts.CancelAfter(TimeSpan.FromSeconds(30));
+
+            try
             {
-              LogBoth("ODiSI closed connection -> reconnecting");
-              break;
-            }
-
-            _bytesRead += n;
-
-            // Extract JSON frames and queue them — NO SQL here
-            for (int i = 0; i < n; i++)
-            {
-              if (TryExtractJsonFrame((char)readBuf[i], out var frame))
+              while (!readCts.Token.IsCancellationRequested)
               {
-                _framesFound++;
-                ParseAndEnqueueFrame(frame);
+                int n = await net.ReadAsync(readBuf.AsMemory(0, readBuf.Length), readCts.Token);
+
+                if (n == 0)
+                {
+                  LogBoth("ODiSI closed connection -> reconnecting");
+                  goto Reconnect;
+                }
+
+                _bytesRead += n;
+
+                for (int i = 0; i < n; i++)
+                {
+                  if (TryExtractJsonFrame(readBuf[i]))
+                  {
+                    _framesFound++;
+                    int? ch = ParseAndEnqueueFrame();
+                    if (ch.HasValue)
+                      channelsReceived.Add(ch.Value);
+                  }
+                }
+
+                HeartbeatIfNeeded();
+
+                if (channelsReceived.Count >= _cfg.ChannelCount)
+                  break;
               }
             }
+            catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+            {
+              LogBoth($"Read phase timeout: got {channelsReceived.Count}/{_cfg.ChannelCount} channels in 30s");
+            }
 
-            HeartbeatIfNeeded();
+            var readElapsed = DateTime.UtcNow - readStart;
+            LogBoth($"Read phase: {channelsReceived.Count}/{_cfg.ChannelCount} channels in {readElapsed.TotalMilliseconds:F0}ms");
+
+            // ── PAUSE PHASE: stop reading → TCP backpressure throttles the controller ──
+            // The controller's send buffer + our receive buffer (~512KB total) fills up,
+            // TCP window goes to 0, and the controller's write() blocks. No data is
+            // generated or buffered on the controller during this time.
+            var sleepTime = LiveWriteInterval - readElapsed;
+            if (sleepTime > TimeSpan.FromMilliseconds(100))
+              await Task.Delay(sleepTime, stoppingToken);
+
+            // ── RESUME: drain stale buffered data before next read phase ──
+            // After the pause, up to ~256KB of data sits in our receive buffer
+            // (sent just before the TCP window closed). Drain it so the next
+            // read phase gets fresh frames.
+            await DrainStaleDataAsync(net, readBuf, stoppingToken);
           }
         }
         catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
@@ -137,6 +202,8 @@ namespace OdIsiIngestService
         {
           LogBoth("ERROR tcp reader loop: " + ex);
         }
+
+        Reconnect:
 
         try
         {
@@ -159,70 +226,128 @@ namespace OdIsiIngestService
     // ══════════════════════════════════════════════════════════════
     //  TCP-side: parse JSON frame and store latest per channel.
     //  This NEVER touches SQL — runs entirely in the read loop.
+    //
+    //  Key optimization: uses Utf8JsonReader on the raw byte buffer
+    //  for a cheap channel+messageType scan. Only frames that pass
+    //  the reader-side throttle are fully parsed (avoiding ~1.2MB
+    //  of string allocations per skipped frame).
     // ══════════════════════════════════════════════════════════════
 
-    private void ParseAndEnqueueFrame(string json)
+    /// <summary>
+    /// Returns the channel number if the frame was accepted, null otherwise.
+    /// </summary>
+    private int? ParseAndEnqueueFrame()
     {
-      JsonDocument doc;
+      var bytes = _frameBuf.AsMemory(0, _frameBufLen);
+
+      // Diagnostic logging for first 10 frames (always parse fully)
+      if (_diagnosticFramesLogged < 10)
+      {
+        _diagnosticFramesLogged++;
+        LogDiagnosticFrameFromBytes(bytes);
+      }
+
+      // ── Cheap scan: extract messageType and channel via Utf8JsonReader (zero alloc) ──
+      string? messageType = null;
+      int? channel = null;
+
       try
       {
-        doc = JsonDocument.Parse(json);
-        Interlocked.Increment(ref _jsonParsed);
+        var reader = new Utf8JsonReader(bytes.Span);
+
+        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+          return null;
+
+        while (reader.Read())
+        {
+          if (reader.TokenType == JsonTokenType.EndObject)
+            break;
+
+          if (reader.TokenType != JsonTokenType.PropertyName)
+            continue;
+
+          bool isChannel = reader.ValueTextEquals("channel"u8);
+          bool isMsgType = reader.ValueTextEquals("message type"u8) ||
+                           reader.ValueTextEquals("message_type"u8) ||
+                           reader.ValueTextEquals("messageType"u8);
+
+          if (!reader.Read()) break; // advance to value
+
+          if (isChannel && reader.TokenType == JsonTokenType.Number)
+            channel = reader.GetInt32();
+          else if (isMsgType && reader.TokenType == JsonTokenType.String)
+            messageType = reader.GetString();
+          else if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray)
+            reader.TrySkip(); // skip nested structures without allocating
+
+          // Once we have both, stop — avoids reading the huge "data" array
+          if (channel.HasValue && messageType != null)
+            break;
+        }
       }
-      catch (Exception ex)
+      catch
       {
-        var preview = json.Length > 200 ? json[..200] : json;
-        _logger.LogWarning(ex, "Invalid JSON from ODiSI (skipping). Preview: {Preview}", preview);
-        return;
+        return null; // malformed JSON
       }
 
-      using (doc)
+      Interlocked.Increment(ref _jsonParsed);
+
+      // Filter non-measurement messages
+      if (!string.IsNullOrWhiteSpace(messageType) &&
+          !string.Equals(messageType, "measurement", StringComparison.OrdinalIgnoreCase))
+        return null;
+
+      if (!channel.HasValue || channel.Value < 1 || channel.Value > _cfg.ChannelCount)
+        return null;
+
+      // ── Reader-side throttle: skip if this channel was recently accepted ──
+      if (!ShouldAcceptFrame(channel.Value))
       {
-        var root = doc.RootElement;
-
-        if (_diagnosticFramesLogged < 10)
-        {
-          _diagnosticFramesLogged++;
-          LogDiagnosticFrame(root, json);
-        }
-
-        // Check message type
-        string? messageType = GetMessageType(root);
-        if (!string.IsNullOrWhiteSpace(messageType) &&
-            !string.Equals(messageType, "measurement", StringComparison.OrdinalIgnoreCase))
-        {
-          return;
-        }
-
-        if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
-          return;
-
-        int? channel = TryGetInt(root, "channel");
-        if (!channel.HasValue || channel.Value < 1 || channel.Value > _cfg.ChannelCount)
-        {
-          _logger.LogWarning("Invalid channel value: {Channel}", channel);
-          return;
-        }
-
-        int gaugeCount = data.GetArrayLength();
-        string vectorArrayJson = data.GetRawText();
-
-        Interlocked.Increment(ref _measurements);
-
-        // Store the latest frame for this channel (overwrites previous if writer hasn't consumed it yet)
-        var mf = new MeasurementFrame
-        {
-          Channel = channel.Value,
-          GaugeCount = gaugeCount,
-          DataJson = vectorArrayJson,
-          ReceivedUtc = DateTime.UtcNow
-        };
-
-        _latestFrameByChannel[channel.Value] = mf;
-
-        // Signal the writer that channel N has new data
-        _writerSignal.Writer.TryWrite(channel.Value);
+        Interlocked.Increment(ref _framesSkipped);
+        return null;
       }
+
+      // Only NOW do we allocate: parse full document from bytes (no string conversion)
+      using var doc = JsonDocument.Parse(bytes);
+      var root = doc.RootElement;
+
+      if (!root.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+        return null;
+
+      int gaugeCount = data.GetArrayLength();
+      string vectorArrayJson = data.GetRawText();
+
+      Interlocked.Increment(ref _measurements);
+      _lastAcceptedByChannel[channel.Value] = DateTime.UtcNow;
+
+      _latestFrameByChannel[channel.Value] = new MeasurementFrame
+      {
+        Channel = channel.Value,
+        GaugeCount = gaugeCount,
+        DataJson = vectorArrayJson,
+        ReceivedUtc = DateTime.UtcNow
+      };
+
+      _writerSignal.Writer.TryWrite(channel.Value);
+      return channel.Value;
+    }
+
+    /// <summary>
+    /// Reader-side throttle: accept a frame only if enough time has elapsed
+    /// since the last accepted frame for this channel. Uses a slightly shorter
+    /// window than the live write interval so data is ready before the writer needs it.
+    /// </summary>
+    private bool ShouldAcceptFrame(int channel)
+    {
+      if (!_lastAcceptedByChannel.TryGetValue(channel, out var last))
+        return true; // never accepted — need data
+
+      var elapsed = DateTime.UtcNow - last;
+      var threshold = LiveWriteInterval - TimeSpan.FromMilliseconds(500);
+      if (threshold < TimeSpan.FromMilliseconds(500))
+        threshold = TimeSpan.FromMilliseconds(500);
+
+      return elapsed >= threshold;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -422,28 +547,30 @@ END";
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  JSON frame extraction (unchanged)
+    //  JSON frame extraction — byte-based (no StringBuilder/string)
+    //
+    //  Accumulates raw bytes into _frameBuf. When a complete JSON
+    //  object/array is detected (depth returns to 0), returns true.
+    //  The caller reads the frame from _frameBuf[0.._frameBufLen].
     // ══════════════════════════════════════════════════════════════
 
-    private bool TryExtractJsonFrame(char ch, out string json)
+    private bool TryExtractJsonFrame(byte b)
     {
-      json = "";
-
       if (!_inJson)
       {
-        if (ch == '{' || ch == '[')
+        if (b == (byte)'{' || b == (byte)'[')
         {
           _inJson = true;
           _depth = 1;
           _inString = false;
           _escape = false;
-          _jsonSb.Clear();
-          _jsonSb.Append(ch);
+          _frameBufLen = 0;
+          AppendToFrameBuf(b);
         }
         return false;
       }
 
-      _jsonSb.Append(ch);
+      AppendToFrameBuf(b);
 
       if (_escape)
       {
@@ -451,13 +578,13 @@ END";
         return false;
       }
 
-      if (ch == '\\')
+      if (b == (byte)'\\')
       {
         if (_inString) _escape = true;
         return false;
       }
 
-      if (ch == '"')
+      if (b == (byte)'"')
       {
         _inString = !_inString;
         return false;
@@ -465,32 +592,78 @@ END";
 
       if (_inString) return false;
 
-      if (ch == '{' || ch == '[') _depth++;
-      else if (ch == '}' || ch == ']') _depth--;
+      if (b == (byte)'{' || b == (byte)'[') _depth++;
+      else if (b == (byte)'}' || b == (byte)']') _depth--;
 
       if (_depth == 0)
       {
-        json = _jsonSb.ToString();
-
         _inJson = false;
-        _jsonSb.Clear();
-        _depth = 0;
-        _inString = false;
-        _escape = false;
-
-        return json.Length >= 2;
+        return _frameBufLen >= 2;
       }
 
-      if (_jsonSb.Length > 2_000_000)
+      if (_frameBufLen > MaxFrameSize)
       {
         _inJson = false;
-        _jsonSb.Clear();
-        _depth = 0;
-        _inString = false;
-        _escape = false;
+        _frameBufLen = 0;
       }
 
       return false;
+    }
+
+    private void AppendToFrameBuf(byte b)
+    {
+      if (_frameBufLen >= _frameBuf.Length)
+      {
+        // Double the buffer (rare — only for unexpectedly large frames)
+        var newBuf = new byte[_frameBuf.Length * 2];
+        Buffer.BlockCopy(_frameBuf, 0, newBuf, 0, _frameBufLen);
+        _frameBuf = newBuf;
+      }
+      _frameBuf[_frameBufLen++] = b;
+    }
+
+    /// <summary>
+    /// After the pause phase, drain stale bytes sitting in the TCP receive
+    /// buffer so the next read phase gets fresh frames. Uses DataAvailable
+    /// to read only what's already buffered (no blocking).
+    /// </summary>
+    private async Task DrainStaleDataAsync(NetworkStream net, byte[] buf, CancellationToken ct)
+    {
+      long drained = 0;
+
+      try
+      {
+        // Read whatever is already in the OS receive buffer (non-blocking check)
+        while (net.DataAvailable)
+        {
+          // Short timeout — we're just draining what's buffered, not waiting for new data
+          using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+          drainCts.CancelAfter(200);
+
+          int n = await net.ReadAsync(buf.AsMemory(0, buf.Length), drainCts.Token);
+          if (n == 0) break;
+          drained += n;
+        }
+      }
+      catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+      {
+        // Drain timeout — fine
+      }
+      catch
+      {
+        // Connection issue — next read will trigger reconnect
+      }
+
+      // Reset JSON framing state so partial frames from the stale data
+      // don't corrupt the next read phase
+      _inJson = false;
+      _frameBufLen = 0;
+      _depth = 0;
+      _inString = false;
+      _escape = false;
+
+      if (drained > 0)
+        LogBoth($"Drained {drained} stale bytes after pause");
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -588,7 +761,37 @@ END";
       if (now - _lastHeartbeatUtc < TimeSpan.FromSeconds(10)) return;
       _lastHeartbeatUtc = now;
 
-      LogBoth($"HB bytes={_bytesRead} frames={_framesFound} parsed={_jsonParsed} meas={_measurements}");
+      LogBoth($"HB bytes={_bytesRead} frames={_framesFound} parsed={_jsonParsed} " +
+              $"meas={_measurements} skipped={_framesSkipped}");
+    }
+
+    private void LogDiagnosticFrameFromBytes(ReadOnlyMemory<byte> bytes)
+    {
+      try
+      {
+        using var doc = JsonDocument.Parse(bytes);
+        var root = doc.RootElement;
+
+        string preview = bytes.Length > 1000
+            ? Encoding.UTF8.GetString(bytes.Span[..1000])
+            : Encoding.UTF8.GetString(bytes.Span);
+
+        bool hasData = root.TryGetProperty("data", out var dbgData) && dbgData.ValueKind == JsonValueKind.Array;
+        int? dbgChannel = TryGetInt(root, "channel");
+        string? dbgMessageType = GetMessageType(root);
+
+        _logger.LogWarning(
+            "ODiSI diagnostic frame #{FrameNo}: messageType={MessageType}, hasData={HasData}, channel={Channel}, preview={Preview}",
+            _diagnosticFramesLogged,
+            dbgMessageType ?? "<none>",
+            hasData,
+            dbgChannel,
+            preview);
+      }
+      catch (Exception ex)
+      {
+        _logger.LogWarning(ex, "Failed to log diagnostic frame #{FrameNo}", _diagnosticFramesLogged);
+      }
     }
 
     private static string? GetMessageType(JsonElement root)
@@ -601,26 +804,6 @@ END";
         return mt3.GetString();
       return null;
     }
-
-    private void LogDiagnosticFrame(JsonElement root, string json)
-    {
-      string preview = json.Length > 1000 ? json[..1000] : json;
-
-      bool hasData = root.TryGetProperty("data", out var dbgData) && dbgData.ValueKind == JsonValueKind.Array;
-      int? dbgChannel = TryGetInt(root, "channel");
-      string? dbgMessageType = GetMessageType(root);
-
-      _logger.LogWarning(
-          "ODiSI diagnostic frame #{FrameNo}: messageType={MessageType}, hasData={HasData}, channel={Channel}, preview={Preview}",
-          _diagnosticFramesLogged,
-          dbgMessageType ?? "<none>",
-          hasData,
-          dbgChannel,
-          preview);
-    }
-
-    private static int GetInt(JsonElement root, string name) =>
-        root.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.Number ? el.GetInt32() : 0;
 
     private static int? TryGetInt(JsonElement root, string name)
     {
